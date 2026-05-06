@@ -1,11 +1,14 @@
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+import pandas as pd
 from supabase import Client
 
 from app.config import Settings, get_settings
 from app.deps import get_supabase
-from app.schemas import ALLOWED_EXTENSIONS, AnalyzeResponse
+from app.schemas import ALLOWED_EXTENSIONS, AnalyzeResponse, ChartSuggestion
+from app.services.aggregation import aggregate_chart_dataframe
 from app.services.llm import generate_chart_suggestions, generate_column_short_labels
 from app.services.profile import (
     build_dataframe_client_dataset,
@@ -20,6 +23,162 @@ from app.services.storage import (
 
 router = APIRouter(tags=["analyze"])
 logger = logging.getLogger(__name__)
+
+
+def _raise_user_friendly_llm_error(exc: RuntimeError) -> None:
+    msg = str(exc)
+    lowered = msg.lower()
+    quota_or_rate = (
+        "429" in msg
+        or "resource_exhausted" in lowered
+        or "resource exhausted" in lowered
+        or "quota exceeded" in lowered
+        or ("quota" in lowered and "gemini" in lowered)
+        or "rate limit" in lowered
+        or "too many requests" in lowered
+    )
+    if quota_or_rate:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "El modelo de IA está recibiendo demasiadas solicitudes en este momento. "
+                "Intente nuevamente en unos minutos."
+            ),
+        ) from exc
+
+    temporarily_unavailable = (
+        "503" in msg
+        or "unavailable" in lowered
+        or "service unavailable" in lowered
+        or "high demand" in lowered
+        or "demand spikes" in lowered
+        or "try again later" in lowered
+    )
+    if temporarily_unavailable:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "El modelo de IA está experimentando alta demanda. "
+                "Intente nuevamente en unos minutos."
+            ),
+        ) from exc
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "No pudimos completar el análisis con IA en este momento. "
+            "Intente nuevamente en unos minutos."
+        ),
+    ) from exc
+
+
+def _minimum_points_for(chart_type: str) -> int:
+    return 3 if chart_type == "scatter" else 2
+
+
+def _is_suggestion_usable(frame: pd.DataFrame, suggestion: ChartSuggestion) -> bool:
+    try:
+        series = aggregate_chart_dataframe(frame, suggestion.chart_type, suggestion.parameters)
+    except ValueError:
+        return False
+    return len(series.data) >= _minimum_points_for(suggestion.chart_type)
+
+
+def _build_fallback_suggestions(frame: pd.DataFrame) -> list[ChartSuggestion]:
+    out: list[ChartSuggestion] = []
+    numeric_cols = [str(c) for c in frame.select_dtypes(include=["number"]).columns]
+    text_cols = [str(c) for c in frame.columns if str(c) not in numeric_cols]
+
+    def add(candidate: ChartSuggestion):
+        if any(
+            s.chart_type == candidate.chart_type and s.parameters == candidate.parameters
+            for s in out
+        ):
+            return
+        if _is_suggestion_usable(frame, candidate):
+            out.append(candidate)
+
+    if text_cols:
+        add(
+            ChartSuggestion(
+                title="Distribución por categoría principal",
+                chart_type="pie",
+                parameters={"category": text_cols[0]},
+                insight=(
+                    "La distribución permite identificar los segmentos con mayor peso relativo y "
+                    "priorizar acciones en los grupos de mayor impacto."
+                ),
+            )
+        )
+
+    if text_cols:
+        y_col = numeric_cols[0] if numeric_cols else text_cols[0]
+        add(
+            ChartSuggestion(
+                title="Concentración por categoría",
+                chart_type="bar",
+                parameters={"x_axis": text_cols[0], "y_axis": y_col},
+                insight=(
+                    "Este análisis revela concentración por categoría y ayuda a enfocar recursos en "
+                    "las entidades con mayor contribución."
+                ),
+            )
+        )
+
+    if len(numeric_cols) >= 2:
+        add(
+            ChartSuggestion(
+                title="Relación entre métricas clave",
+                chart_type="scatter",
+                parameters={"x_axis": numeric_cols[0], "y_axis": numeric_cols[1]},
+                insight=(
+                    "La correlación entre ambas métricas ayuda a detectar patrones de rendimiento "
+                    "y posibles oportunidades de optimización."
+                ),
+            )
+        )
+
+    if text_cols:
+        y_col = numeric_cols[0] if numeric_cols else text_cols[0]
+        add(
+            ChartSuggestion(
+                title="Comparativo de categorías secundarias",
+                chart_type="bar",
+                parameters={"x_axis": text_cols[min(1, len(text_cols) - 1)], "y_axis": y_col},
+                insight=(
+                    "Comparar categorías secundarias permite identificar desviaciones operativas y "
+                    "ajustar decisiones comerciales con mayor precisión."
+                ),
+            )
+        )
+
+    if len(out) >= 3:
+        return out[:5]
+    return []
+
+
+def _select_reliable_suggestions(
+    frame: pd.DataFrame, llm_suggestions: list[ChartSuggestion]
+) -> list[ChartSuggestion]:
+    unique: dict[tuple[str, str], ChartSuggestion] = {}
+    for s in llm_suggestions:
+        key = (s.chart_type, str(sorted(s.parameters.items())))
+        if key in unique:
+            continue
+        unique[key] = s
+    valid = [s for s in unique.values() if _is_suggestion_usable(frame, s)]
+    if len(valid) >= 3:
+        return valid[:5]
+    fallback = _build_fallback_suggestions(frame)
+    combined: list[ChartSuggestion] = []
+    seen: set[tuple[str, str]] = set()
+    for s in [*valid, *fallback]:
+        key = (s.chart_type, str(sorted(s.parameters.items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(s)
+    return combined[:5]
 
 
 @router.post(
@@ -67,37 +226,23 @@ def analyze_upload(
     try:
         suggestions = generate_chart_suggestions(profile, settings)
     except RuntimeError as exc:
-        msg = str(exc)
-        lowered = msg.lower()
-        if (
-            "429" in msg
-            or "resource_exhausted" in lowered
-            or "quota exceeded" in lowered
-            or ("quota" in lowered and "gemini" in lowered)
-            or "rate limit" in lowered
-        ):
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    "Cuota o límite de la API de Gemini alcanzado en todos los modelos probados "
-                    "automáticamente en el servidor (económicos primero y, en última instancia, "
-                    "modelos más potentes). Espere uno o dos minutos e intente nuevamente."
-                ),
-            ) from exc
-        if (
-            "503" in msg
-            or "unavailable" in lowered
-            or "service unavailable" in lowered
-            or "high demand" in lowered
-        ):
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "La API de Gemini está temporalmente saturada por alta demanda. "
-                    "Intente nuevamente en uno o dos minutos."
-                ),
-            ) from exc
-        raise HTTPException(status_code=502, detail=f"LLM suggestion failure: {exc}") from exc
+        _raise_user_friendly_llm_error(exc)
+
+    suggestions = _select_reliable_suggestions(frame, suggestions)
+    if len(suggestions) < 3:
+        fallback_id = str(uuid.uuid4())
+        logger.warning(
+            "No reliable chart suggestions for upload %s: generated=%s",
+            fallback_id,
+            len(suggestions),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No se pudieron construir al menos 3 gráficas confiables con puntos suficientes "
+                "para este archivo. Revise tipos de columna o cargue más registros válidos."
+            ),
+        )
 
     upload_id = new_upload_id()
     original_key, parquet_key = storage_object_paths(upload_id, ext)
