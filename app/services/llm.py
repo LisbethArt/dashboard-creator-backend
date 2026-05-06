@@ -376,6 +376,8 @@ def generate_chart_suggestions(profile: DataFrameProfileText, settings: Settings
         "CRITICAL parameters rule: Every column referenced in parameters must be spelled EXACTLY as in "
         "column_names_dtypes_nunique—including names like 'Unnamed: 0', spaces, punctuation, accents. Never invent "
         "column names from sample text only; qualitative text fields with moderate nunique are valid for bars/pie.\n"
+        "CRITICAL insight rule: The insight must discuss business/data findings only. Never ask to rename columns, "
+        "never propose header cleanup, and never mention placeholders such as 'Unnamed:*'.\n"
         'Example element (valid only when region has nunique ≤ 12 in the profile): '
         '{"title":"Sales by Region","chart_type":"bar","parameters":'
         '{"x_axis":"region","y_axis":"revenue"},"insight":"Norte domina..."}\n'
