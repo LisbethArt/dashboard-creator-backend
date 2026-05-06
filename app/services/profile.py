@@ -1,0 +1,420 @@
+import io
+import math
+import re
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from app.schemas import (
+    AiColumnCorrection,
+    CANONICAL_SCHEMA_TYPES,
+    DataframeClientDataset,
+    DatasetColumn,
+    DatasetTypeDistribution,
+)
+
+
+@dataclass(frozen=True)
+class DataFrameProfileText:
+    """
+    Serializable summary of a tabular dataset for LLM consumption.
+    """
+
+    text: str
+
+
+def parse_tabular_bytes(content: bytes, suffix: str) -> pd.DataFrame:
+    buffer = io.BytesIO(content)
+    if suffix == ".csv":
+        return pd.read_csv(buffer)
+    if suffix == ".xlsx":
+        return pd.read_excel(buffer, engine="openpyxl")
+    raise ValueError("Unsupported file format")
+
+
+def _cell_as_str(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    if hasattr(value, "isoformat") and not isinstance(value, (str, bytes)):
+        try:
+            return pd.Timestamp(value).isoformat(sep=" ", timespec="seconds")
+        except (TypeError, ValueError, OverflowError):
+            return str(value).strip()
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def _truncate_sample(s: str, maxlen: int) -> str:
+    t = s.strip()
+    if len(t) <= maxlen:
+        return t
+    return t[: max(1, maxlen - 1)] + "…"
+
+
+def _distinct_head_strings(
+    series: pd.Series,
+    *,
+    max_rows_scan: int,
+    max_values: int,
+    maxlen: int,
+) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for val in series.head(max_rows_scan):
+        raw = _truncate_sample(_cell_as_str(val), maxlen)
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        out.append(raw)
+        if len(out) >= max_values:
+            break
+    return out
+
+
+def build_dataframe_profile(
+    df: pd.DataFrame,
+    max_categorical_values: int = 6,
+    max_numeric_columns: int = 12,
+    max_category_columns: int = 8,
+) -> DataFrameProfileText:
+    """
+    Builds a compact natural-language and structured summary of ``df`` for downstream LLM prompts.
+
+    Column lists and cardinality previews are capped to reduce input tokens sent to Gemini
+    (helps stay within free-tier limits and lowers 429/quota exhaustion risk).
+    """
+    if df.empty:
+        return DataFrameProfileText(text="The dataset has 0 rows.")
+
+    lines: list[str] = []
+    lines.append(f"rows: {len(df)}")
+    cols = list(df.columns)[:40]
+    lines.append(f"column_count: {len(df.columns)} (showing_first_{len(cols)})")
+    lines.append(
+        "When headers are Unnamed, generic, or truncated, infer meaning from sample_cells_first_rows "
+        "plus categorical_top_values (exports and encuestas often misplace real titles)."
+    )
+    lines.append(
+        "column_names_dtypes_nunique (use nunique to judge if an axis stays readable):"
+    )
+    for col in cols:
+        nu = int(df[col].nunique(dropna=True))
+        lines.append(f"  - {col!r}: dtype={df[col].dtype} nunique={nu}")
+
+    num_df = df.select_dtypes(include=["number"])
+    numeric_sample = list(num_df.columns)[:max_numeric_columns]
+    if numeric_sample:
+        desc = df[numeric_sample].describe().transpose()
+        lines.append("numeric_describe (count, mean, std, min, max):")
+        for col in desc.index[:max_numeric_columns]:
+            row = desc.loc[col]
+            lines.append(
+                f"  - {col!r}: count={row.get('count', '')} mean={row.get('mean', '')} "
+                f"std={row.get('std', '')} min={row.get('min', '')} max={row.get('max', '')}"
+            )
+
+    non_numeric_in_profile = [c for c in cols if c not in num_df.columns]
+    for col in non_numeric_in_profile[:max_category_columns]:
+        vc = df[col].dropna().astype(str).value_counts().head(max_categorical_values)
+        if vc.empty:
+            continue
+        preview = ", ".join(f"{k}={v}" for k, v in vc.items())
+        lines.append(f"categorical_top_values {col!r}: {preview}")
+
+    for col in cols:
+        samples = _distinct_head_strings(df[col], max_rows_scan=48, max_values=10, maxlen=96)
+        if samples:
+            lines.append(f"sample_cells_first_rows {col!r}: {' | '.join(samples)}")
+
+    text = "\n".join(lines)
+    max_chars = 14_000
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[profile truncated]"
+    return DataFrameProfileText(text=text)
+
+
+def _coarse_kind(schema_type: str) -> str:
+    if schema_type in ("date", "time", "datetime"):
+        return "datetime"
+    if schema_type in ("int", "float"):
+        return "numeric"
+    return "text"
+
+
+def _pretty_header_from_snake(name: str) -> str:
+    if "_" not in name:
+        return name
+    parts = [p for p in str(name).split("_") if p]
+    return "_".join((p[0].upper() + p[1:].lower()) if p else "" for p in parts)
+
+
+def _dtype_default_schema(series: pd.Series) -> str:
+    dtype = series.dtype
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return "datetime"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "int"
+    if pd.api.types.is_numeric_dtype(dtype):
+        return "float"
+    return "string"
+
+
+def _series_mostly_datetime(series: pd.Series) -> str | None:
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return None
+    sample = non_null.head(min(400, len(non_null))).astype(str).str.strip()
+    parsed = pd.to_datetime(sample, errors="coerce", utc=False)
+    ratio = float(parsed.notna().sum()) / float(len(sample))
+    if ratio < 0.82:
+        return None
+    ts = parsed.dropna()
+    if len(ts) < 1:
+        return "datetime"
+    tidx = ts.dt
+    midnight = bool((tidx.hour == 0).all() and (tidx.minute == 0).all() and (tidx.second == 0).all())
+    if midnight:
+        return "date"
+    norm_days = int(ts.dt.normalize().nunique())
+    has_clock = bool((tidx.hour != 0).any() or (tidx.minute != 0).any() or (tidx.second != 0).any())
+    if norm_days <= 1 and has_clock:
+        return "time"
+    return "datetime"
+
+
+def _series_mostly_numeric(series: pd.Series) -> str | None:
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return None
+    sample = non_null.head(min(400, len(non_null))).astype(str).str.strip()
+    sample = sample.str.replace(",", ".", regex=False)
+    num = pd.to_numeric(sample, errors="coerce")
+    ratio = float(num.notna().sum()) / float(len(sample))
+    if ratio < 0.88:
+        return None
+    vals = num.dropna()
+    if vals.empty:
+        return None
+    arr = vals.to_numpy(dtype=float, copy=False)
+    if np.allclose(arr, np.round(arr)):
+        return "int"
+    return "float"
+
+
+def _smart_schema_target(series: pd.Series) -> str:
+    base = _dtype_default_schema(series)
+    if base != "string":
+        return base
+    dt_kind = _series_mostly_datetime(series)
+    if dt_kind:
+        return dt_kind
+    num_kind = _series_mostly_numeric(series)
+    if num_kind:
+        return num_kind
+    return "string"
+
+
+def build_dataset_column(series: pd.Series) -> DatasetColumn:
+    default_sel = _dtype_default_schema(series)
+    kind = _coarse_kind(default_sel)
+    return DatasetColumn(
+        name=str(series.name),
+        pandas_dtype=str(series.dtype),
+        kind=kind,  # type: ignore[arg-type]
+        select_options=list(CANONICAL_SCHEMA_TYPES),
+        default_select=default_sel,  # type: ignore[arg-type]
+    )
+
+
+def _norm_col_key(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name).strip()).casefold()
+
+
+def attach_display_label_hints(
+    columns: list[DatasetColumn],
+    hints: dict[str, str] | None,
+) -> list[DatasetColumn]:
+    """
+    Applies IA short labels keyed by technical column names (exact or whitespace-normalised match).
+    """
+    if not hints:
+        return columns
+    by_norm = {_norm_col_key(k): (k, str(v).strip()) for k, v in hints.items() if str(v).strip()}
+    attached: list[DatasetColumn] = []
+    for col in columns:
+        label = hints.get(col.name)
+        if label:
+            trimmed = label.strip()[:96]
+            if trimmed:
+                attached.append(col.model_copy(update={"suggested_short_label": trimmed}))
+                continue
+        alt = by_norm.get(_norm_col_key(col.name))
+        if alt and alt[1]:
+            attached.append(col.model_copy(update={"suggested_short_label": alt[1][:96]}))
+        else:
+            attached.append(col)
+    return attached
+
+
+def build_ai_corrections(df: pd.DataFrame, columns: list[DatasetColumn]) -> list[AiColumnCorrection]:
+    out: list[AiColumnCorrection] = []
+    for meta in columns:
+        series = df[meta.name]
+        refined = _smart_schema_target(series)
+        if refined == meta.default_select:
+            continue
+        sug_header = _pretty_header_from_snake(meta.name) if "_" in meta.name else None
+        if sug_header == meta.name:
+            sug_header = None
+        out.append(
+            AiColumnCorrection(column=meta.name, target_type=refined, suggested_header=sug_header)
+        )
+    return out
+
+
+_SCHEMA_TYPE_LABEL_ES: dict[str, str] = {
+    "int": "número entero",
+    "float": "número con decimales",
+    "string": "texto",
+    "date": "solo fecha",
+    "time": "solo hora",
+    "datetime": "fecha y hora",
+}
+
+
+def _format_ai_hint(corrections: list[AiColumnCorrection]) -> str:
+    if not corrections:
+        return (
+            "Según los datos que revisamos, los tipos de columna que se muestran encajan bien con "
+            "el contenido. Si algo no coincide con lo que usted conoce del archivo (por ejemplo una "
+            "fecha que apareció como texto), puede corregirlo arriba en la tabla."
+        )
+    lines = [
+        "En algunas columnas tiene sentido revisar el tipo que aparece en la cabecera de la tabla. "
+        "Puede cambiarlos usted mismo donde prefiera:"
+    ]
+    for c in corrections[:8]:
+        label = _SCHEMA_TYPE_LABEL_ES.get(c.target_type, c.target_type)
+        extra = f'. Para el nombre visible puede usar «{c.suggested_header}»' if c.suggested_header else ''
+        lines.append(f"• «{c.column}»: quizá encaje mejor como {label}{extra}.")
+    if len(corrections) > 8:
+        lines.append(f"• …y {len(corrections) - 8} columnas más.")
+    return "\n".join(lines)
+
+
+def _type_distribution_counts(df: pd.DataFrame) -> DatasetTypeDistribution:
+    strings = 0
+    numerics = 0
+    datetimes = 0
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s.dtype):
+            datetimes += 1
+        elif pd.api.types.is_numeric_dtype(s.dtype):
+            numerics += 1
+        else:
+            strings += 1
+    return DatasetTypeDistribution(strings=strings, numerics=numerics, datetimes=datetimes)
+
+
+def build_dataframe_client_dataset(
+    df: pd.DataFrame,
+    *,
+    max_cols: int = 40,
+    max_preview_rows: int = 100,
+    display_label_hints: dict[str, str] | None = None,
+) -> DataframeClientDataset:
+    col_all = list(df.columns)
+    if not col_all:
+        return DataframeClientDataset(
+            row_count=0,
+            column_count=0,
+            sample_tag="SIN COLUMNAS",
+            columns=[],
+            preview_rows=[],
+            null_cells=0,
+            duplicate_rows=0,
+            memory_mb=0.0,
+            numeric_skew=None,
+            integrity_percent=100.0,
+            ai_hint="No se encontraron columnas en este archivo.",
+            ai_corrections=[],
+            type_distribution=DatasetTypeDistribution(strings=0, numerics=0, datetimes=0),
+        )
+
+    if df.empty:
+        cols_slice_empty = col_all[:max_cols]
+        columns_empty: list[DatasetColumn] = []
+        for name in cols_slice_empty:
+            columns_empty.append(build_dataset_column(df[name]))
+        columns_empty = attach_display_label_hints(columns_empty, display_label_hints)
+        ai_corr_empty = build_ai_corrections(df, columns_empty)
+        return DataframeClientDataset(
+            row_count=0,
+            column_count=len(col_all),
+            sample_tag="MUESTRA DEL 0%",
+            columns=columns_empty,
+            preview_rows=[],
+            null_cells=0,
+            duplicate_rows=0,
+            memory_mb=round(float(df.memory_usage(deep=True).sum() / 1_000_000.0), 2),
+            numeric_skew=None,
+            integrity_percent=100.0,
+            ai_hint=_format_ai_hint(ai_corr_empty),
+            ai_corrections=ai_corr_empty,
+            type_distribution=_type_distribution_counts(df),
+        )
+
+    cols_slice = col_all[:max_cols]
+    sub = df[cols_slice]
+    row_total = len(df)
+    null_cells = int(df.isna().sum().sum())
+    total_cells = max(1, row_total * len(col_all))
+    integrity = round(100.0 * (1.0 - null_cells / total_cells), 1)
+
+    columns = attach_display_label_hints(
+        [build_dataset_column(df[name]) for name in cols_slice],
+        display_label_hints,
+    )
+
+    preview_cap = min(max_preview_rows, row_total)
+    preview_rows: list[dict[str, str]] = []
+    for _, row in sub.head(preview_cap).iterrows():
+        preview_rows.append({str(k): _cell_as_str(row[k]) for k in cols_slice})
+
+    pct = min(100, max(1, round(100 * preview_cap / row_total)))
+    sample_tag = f"MUESTRA DEL {pct}%"
+
+    duplicate_rows = int(df.duplicated().sum())
+    memory_mb = round(float(df.memory_usage(deep=True).sum() / 1_000_000.0), 2)
+
+    numeric_skew: float | None = None
+    num_df = df.select_dtypes(include=["number"])
+    if len(num_df.columns):
+        s = pd.to_numeric(num_df.iloc[:, 0], errors="coerce").dropna()
+        if len(s) > 2:
+            sk = float(s.skew())
+            if not math.isnan(sk):
+                numeric_skew = round(sk, 2)
+
+    ai_corrections = build_ai_corrections(df, columns)
+    ai_hint = _format_ai_hint(ai_corrections)
+
+    return DataframeClientDataset(
+        row_count=row_total,
+        column_count=len(col_all),
+        sample_tag=sample_tag,
+        columns=columns,
+        preview_rows=preview_rows,
+        null_cells=null_cells,
+        duplicate_rows=duplicate_rows,
+        memory_mb=memory_mb,
+        numeric_skew=numeric_skew,
+        integrity_percent=integrity,
+        ai_hint=ai_hint,
+        ai_corrections=ai_corrections,
+        type_distribution=_type_distribution_counts(df),
+    )
