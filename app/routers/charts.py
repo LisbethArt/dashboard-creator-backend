@@ -10,7 +10,22 @@ from app.services.storage import fetch_upload_row, load_dataframe_from_parquet
 router = APIRouter(tags=["charts"])
 
 
-@router.post("/charts/series", response_model=ChartSeriesResponse)
+@router.post(
+    "/charts/series",
+    response_model=ChartSeriesResponse,
+    summary="Construir serie de gráfica desde upload",
+    description=(
+        "A partir de un `upload_id` existente, carga el parquet almacenado en Supabase y genera "
+        "la serie agregada según `chart_type` y `parameters`.\n\n"
+        "Soporta: `bar`, `line`, `pie`, `scatter`."
+    ),
+    responses={
+        400: {"description": "Parámetros inválidos para el tipo de gráfica solicitado."},
+        404: {"description": "No existe un upload con el `upload_id` indicado."},
+        500: {"description": "Metadata inconsistente del upload (sin parquet_path)."},
+        502: {"description": "Error leyendo dataset persistido desde Supabase."},
+    },
+)
 def build_chart_series(
     body: ChartSeriesRequest,
     settings: Settings = Depends(get_settings),

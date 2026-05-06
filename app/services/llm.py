@@ -30,6 +30,10 @@ class GeminiModelUnavailable(Exception):
     """Raised when the model id is unknown or not enabled for this key; try another id."""
 
 
+class GeminiTransientUnavailable(Exception):
+    """Raised when Gemini is temporarily unavailable due to demand spikes; try another model id."""
+
+
 def _is_quota_or_rate_limit(exc: BaseException) -> bool:
     msg = str(exc).lower()
     if exc.__class__.__name__.lower() in ("resourceexhausted", "toomanyrequests"):
@@ -41,6 +45,18 @@ def _is_quota_or_rate_limit(exc: BaseException) -> bool:
         "quota",
         "rate limit",
         "too many requests",
+    )
+    return any(n in msg for n in needles)
+
+
+def _is_transient_unavailable(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "503",
+        "unavailable",
+        "service unavailable",
+        "currently experiencing high demand",
+        "demand spikes are usually temporary",
     )
     return any(n in msg for n in needles)
 
@@ -221,6 +237,8 @@ def generate_column_short_labels(
                     raise GeminiModelUnavailable(str(exc)) from exc
                 if _is_quota_or_rate_limit(exc):
                     raise GeminiQuotaOrRateLimit(str(exc)) from exc
+                if _is_transient_unavailable(exc):
+                    raise GeminiTransientUnavailable(str(exc)) from exc
                 raise RuntimeError(f"Gemini request failed: {exc}") from exc
             out = _response_text(response)
             if not out:
@@ -283,6 +301,12 @@ def generate_column_short_labels(
                 last_quota = exc
                 logger.warning(
                     "Gemini quota or rate limit on model %s while labeling columns; trying next",
+                    model_name,
+                )
+                continue
+            except GeminiTransientUnavailable:
+                logger.warning(
+                    "Gemini transient unavailable on model %s while labeling columns; trying next",
                     model_name,
                 )
                 continue
@@ -363,6 +387,7 @@ def generate_chart_suggestions(profile: DataFrameProfileText, settings: Settings
     try:
         models_to_try = _unique_model_order(settings.gemini_model)
         last_quota: GeminiQuotaOrRateLimit | None = None
+        last_unavailable: GeminiTransientUnavailable | None = None
 
         def run_prompt(model_name: str, text: str) -> str:
             try:
@@ -379,6 +404,8 @@ def generate_chart_suggestions(profile: DataFrameProfileText, settings: Settings
                     raise GeminiModelUnavailable(str(exc)) from exc
                 if _is_quota_or_rate_limit(exc):
                     raise GeminiQuotaOrRateLimit(str(exc)) from exc
+                if _is_transient_unavailable(exc):
+                    raise GeminiTransientUnavailable(str(exc)) from exc
                 raise RuntimeError(f"Gemini request failed: {exc}") from exc
             out = _response_text(response)
             if not out:
@@ -433,6 +460,13 @@ def generate_chart_suggestions(profile: DataFrameProfileText, settings: Settings
                     model_name,
                 )
                 continue
+            except GeminiTransientUnavailable as exc:
+                last_unavailable = exc
+                logger.warning(
+                    "Gemini transient unavailable on model %s; trying next fallback if available",
+                    model_name,
+                )
+                continue
 
         if last_quota:
             tried = ", ".join(models_to_try)
@@ -440,6 +474,12 @@ def generate_chart_suggestions(profile: DataFrameProfileText, settings: Settings
                 "Gemini quota or rate limit on all attempted models "
                 f"({tried}). Wait briefly or review limits in Google AI Studio."
             ) from last_quota
+        if last_unavailable:
+            tried = ", ".join(models_to_try)
+            raise RuntimeError(
+                "Gemini service temporarily unavailable on all attempted models "
+                f"({tried}). Retry in a minute."
+            ) from last_unavailable
 
         raise RuntimeError(
             "None of the configured Gemini model IDs worked for this API key "

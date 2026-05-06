@@ -22,7 +22,22 @@ router = APIRouter(tags=["analyze"])
 logger = logging.getLogger(__name__)
 
 
-@router.post("/analyze", response_model=AnalyzeResponse)
+@router.post(
+    "/analyze",
+    response_model=AnalyzeResponse,
+    summary="Analizar archivo y generar sugerencias",
+    description=(
+        "Recibe un archivo tabular (`.csv` o `.xlsx`), construye su perfil, solicita entre 3 y 5 "
+        "sugerencias de visualización con IA, genera metadata para cliente y persiste contenido en Supabase.\n\n"
+        "Devuelve `upload_id` para consultas posteriores de series."
+    ),
+    responses={
+        400: {"description": "Archivo inválido, vacío o con formato no soportado."},
+        429: {"description": "Cuota/límite de Gemini alcanzado en los modelos probados."},
+        502: {"description": "Fallo aguas arriba (LLM o persistencia en Supabase)."},
+        503: {"description": "Proveedor IA temporalmente no disponible por alta demanda."},
+    },
+)
 def analyze_upload(
     file: UploadFile = File(...),
     settings: Settings = Depends(get_settings),
@@ -66,8 +81,20 @@ def analyze_upload(
                 detail=(
                     "Cuota o límite de la API de Gemini alcanzado en todos los modelos probados "
                     "automáticamente en el servidor (económicos primero y, en última instancia, "
-                    "modelos más potentes). Espere uno o dos minutos o revise su plan en "
-                    "Google AI Studio (https://aistudio.google.com)."
+                    "modelos más potentes). Espere uno o dos minutos e intente nuevamente."
+                ),
+            ) from exc
+        if (
+            "503" in msg
+            or "unavailable" in lowered
+            or "service unavailable" in lowered
+            or "high demand" in lowered
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "La API de Gemini está temporalmente saturada por alta demanda. "
+                    "Intente nuevamente en uno o dos minutos."
                 ),
             ) from exc
         raise HTTPException(status_code=502, detail=f"LLM suggestion failure: {exc}") from exc
