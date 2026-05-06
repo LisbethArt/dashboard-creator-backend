@@ -27,6 +27,10 @@ class DatasetColumn(BaseModel):
     kind: Literal["datetime", "numeric", "text"]
     select_options: list[str]
     default_select: SchemaColumnTypeLiteral
+    display_name: str | None = Field(
+        default=None,
+        description="Canonical visible label used across preview, mapping and IA hints.",
+    )
     suggested_short_label: str | None = Field(
         default=None,
         description="Short Spanish label from IA for UI; parquet key remains `name`.",
